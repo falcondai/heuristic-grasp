@@ -39,7 +39,14 @@ def update_image(msg):
     pub.publish(msg)
 rospy.Subscriber('/cameras/left_hand_camera/image', Image, update_image)
 
-print 'saving image in 5 seconds...'
-rospy.sleep(5.)
-gripper_image = to_rgb(current_image)
-gripper_image.save('gripper_mask.png')
+def save_image(msg):
+    if msg.state == DigitalIOState.PRESSED:
+        gripper_image = to_rgb(current_image)
+        fn = 'gripper_mask.png'
+        gripper_image.save(fn)
+        print 'image saved to %s' % fn
+        rospy.signal_shutdown('done')
+rospy.Subscriber('/robot/digital_io/left_upper_button/state', DigitalIOState, save_image)
+
+print 'save image when the large cuff button is pressed'
+rospy.spin()
