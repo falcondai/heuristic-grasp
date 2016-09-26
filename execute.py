@@ -4,6 +4,7 @@ from baxter_interface.limb import Limb
 from baxter_pykdl import baxter_kinematics
 import numpy as np
 import tqdm
+from copy import deepcopy
 
 from std_msgs.msg import Header
 from baxter_core_msgs.msg import DigitalIOState, EndEffectorState
@@ -61,14 +62,35 @@ def localize_cluster_method(image, gripper_mask, model, percentile=2):
             best_cu, best_cv = cu, cv
         draw.ellipse([(cu-10, cv-10), (cu+10, cv+10)], outline=(0, 255, 0))
         draw.text((cu, cv), str(i))
+    draw.ellipse([(best_cu-10, best_cv-10), (best_cu+10, best_cv+10)], outline=(0, 0, 255))
     debug_image.save('clusters.png')
     return best_cu, best_cv
 
+def tf_uv2xy(camera, tl, z_table, stamp, cu, cv):
+    nx, ny, nz = camera.projectPixelTo3dRay((cu-320, cv-200))
+    # get transform at the time of image acquisition
+    obj_point = PointStamped()
+    obj_point.header.frame_id = camera.tfFrame()
+    obj_point.header.stamp = stamp
+    obj_point.point.x = nx
+    obj_point.point.y = ny
+    obj_point.point.z = nz
+
+    pt = tl.transformPoint('/base', obj_point)
+
+    # find ray-table intersection
+    camera_xyz, _ = tl.lookupTransform('/base', camera.tfFrame(), stamp)
+    k = (z_table - camera_xyz[2]) / (pt.point.z - camera_xyz[2])
+    # intersection: k * pt.point.x, k * pt.point.y, k * pt.point.z
+    ox, oy = k * (pt.point.x - camera_xyz[0]) + camera_xyz[0], k * (pt.point.y - camera_xyz[1]) + camera_xyz[1]
+    # print 'object location', ox, oy
+    return ox, oy
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--n_attempts', type=int, default=10)
     parser.add_argument('--no_replacement', action='store_true')
+    parser.add_argument('--two_shot', action='store_true')
 
     args = parser.parse_args()
 
@@ -153,25 +175,12 @@ if __name__ == '__main__':
         rospy.sleep(1.)
         # localize one cube
         # cu, cv = localize_cm_method(current_image, gripper_mask)
+        stamp = deepcopy(current_image_stamp)
         cu, cv = localize_cluster_method(current_image, gripper_mask, dbscan, percentile=3)
         # cu, cv = localize_cluster_method(current_image, gripper_mask, meanshift)
 
-        nx, ny, nz = camera.projectPixelTo3dRay((cu-320, cv-200))
-        # get transform at the time of image acquisition
-        obj_point = PointStamped()
-        obj_point.header.frame_id = camera.tfFrame()
-        obj_point.header.stamp = current_image_stamp
-        obj_point.point.x = nx
-        obj_point.point.y = ny
-        obj_point.point.z = nz
-
-        pt = tl.transformPoint('/base', obj_point)
-
-        # find ray-table intersection
-        camera_xyz, _ = tl.lookupTransform('/base', camera.tfFrame(), current_image_stamp)
-        k = (z_table - camera_xyz[2]) / (pt.point.z - camera_xyz[2])
-        # intersection: k * pt.point.x, k * pt.point.y, k * pt.point.z
-        ox, oy = k * (pt.point.x - camera_xyz[0]) + camera_xyz[0], k * (pt.point.y - camera_xyz[1]) + camera_xyz[1]
+        # transform from image UV frame to base XY frame
+        ox, oy = tf_uv2xy(camera, tl, z_table, stamp, cu, cv)
         print 'object location', ox, oy
 
         display_image = current_image.copy()
@@ -179,7 +188,6 @@ if __name__ == '__main__':
         draw.ellipse([(cu-10, cv-10), (cu+10, cv+10)], outline=(0, 255, 0))
         # draw.ellipse([(u+320-10, v+200-10), (u+320+10, v+200+10)], outline=(0, 255, 0))
         coords = map(lambda x: '%g' % x, left.endpoint_pose()['position'])
-        quat = map(str, left.endpoint_pose()['orientation'])
         draw.text((20, 40), 'hand: '+', '.join(coords), font=font)
         draw.text((20, 20), 'object: '+', '.join(['%g' % ox, '%g' % oy]), font=font)
         msg = Image(
@@ -196,10 +204,40 @@ if __name__ == '__main__':
         )
         pub.publish(msg)
 
-        # choose a random
+        # choose a random gripper orientation
         quat = Quat.from_v_theta([0., 0., 1.], np.random.rand() * 2. * np.pi)
         # move to pre-grasp pose
         execute_linear(left, ox, oy, z_initial, quat, n_steps=1)
+        if args.two_shot:
+            rospy.sleep(0.5)
+            stamp = deepcopy(current_image_stamp)
+            display_image = current_image.copy()
+            cu, cv = localize_cluster_method(current_image, gripper_mask, dbscan, percentile=3)
+            ox, oy = tf_uv2xy(camera, tl, z_table, stamp, cu, cv)
+            print '2nd shot, object location', ox, oy
+
+            draw = PIL_ImageDraw.Draw(display_image)
+            draw.ellipse([(cu-10, cv-10), (cu+10, cv+10)], outline=(0, 255, 0))
+            # draw.ellipse([(u+320-10, v+200-10), (u+320+10, v+200+10)], outline=(0, 255, 0))
+            coords = map(lambda x: '%g' % x, left.endpoint_pose()['position'])
+            draw.text((20, 40), 'hand: '+', '.join(coords), font=font)
+            draw.text((20, 20), 'object: '+', '.join(['%g' % ox, '%g' % oy]), font=font)
+            msg = Image(
+                header=Header(
+                    stamp=rospy.Time.now(),
+                    frame_id='base',
+                ),
+                width=640,
+                height=400,
+                step=640 * 4,
+                encoding='bgra8',
+                is_bigendian=0,
+                data=display_image.tobytes(),
+            )
+            pub.publish(msg)
+
+            execute_linear(left, ox, oy, z_initial, quat, n_steps=1)
+
         # IK execution reached pose from the commanded pose
         execution_error = np.linalg.norm(np.asarray(left.endpoint_pose()['position'])[:2] - [ox, oy])
         print 'execution error:', execution_error
@@ -208,30 +246,34 @@ if __name__ == '__main__':
             traj = execute_vertical(left, z_table, n_steps=8, duration=4., timeout=8.)
             left_gripper.close()
             rospy.sleep(0.5)
-            # lift arm
-            execute_vertical(left, z_initial, n_steps=1, duration=2., timeout=4.)
-            rospy.sleep(0.5)
-            # use grasp force to recognize grasp success
-            print 'grasp force', force
-            if force > grasp_force_threshold:
-                print 'grasp succeeded'
-                # move to a random location in workspace
-                a, b, c = np.random.rand(3)
-                if args.no_replacement:
-                    x = a * aux_workspace_low[0] + (1. - a) * aux_workspace_high[0]
-                    y = b * aux_workspace_low[1] + (1. - b) * aux_workspace_high[1]
-                else:
-                    x = a * workspace_low[0] + (1. - a) * workspace_high[0]
-                    y = b * workspace_low[1] + (1. - b) * workspace_high[1]
-                print 'dropping the grasped object at a random location', x, y
-                execute_linear(left, x, y, z_initial, Quat.from_v_theta([0,0,1], c * 2. * np.pi), n_steps=1, duration=2., timeout=4.)
-                n_successes += 1
+            if left.endpoint_pose()['position'][2] - z_table > 0.5 * (z_initial - z_table):
+                print 'IK descent trajectory execution error'
+                n_ik_errors += 1
             else:
-                print 'grasp failed'
+                # lift arm
+                execute_vertical(left, z_initial, n_steps=1, duration=2., timeout=4.)
+                rospy.sleep(0.5)
+                # use grasp force to recognize grasp success
+                print 'grasp force', force
+                if force > grasp_force_threshold:
+                    print 'grasp succeeded'
+                    # move to a random location in workspace
+                    a, b, c = np.random.rand(3)
+                    if args.no_replacement:
+                        x = a * aux_workspace_low[0] + (1. - a) * aux_workspace_high[0]
+                        y = b * aux_workspace_low[1] + (1. - b) * aux_workspace_high[1]
+                    else:
+                        x = a * workspace_low[0] + (1. - a) * workspace_high[0]
+                        y = b * workspace_low[1] + (1. - b) * workspace_high[1]
+                    print 'dropping the grasped object at a random location', x, y
+                    execute_linear(left, x, y, z_initial, Quat.from_v_theta([0,0,1], c * 2. * np.pi), n_steps=1, duration=2., timeout=4.)
+                    n_successes += 1
+                else:
+                    print 'grasp failed'
             # release object
             left_gripper.open()
         else:
-            print 'IK trajectory execution error'
+            print 'IK approach trajectory execution error'
             n_ik_errors += 1
             continue
 

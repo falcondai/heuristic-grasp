@@ -1,0 +1,1 @@
+wrsync $@ --exclude=*.png
